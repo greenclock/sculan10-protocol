@@ -585,34 +585,34 @@ def find_spectrum_end(packet):
     return min(len(packet), 2000)
 ```
 
-In practice the active region is **roughly 1700–1900 bins** for typical
-scope spans (200 kHz–500 kHz). The boundary position is stable for a
-given scope span and does not move with VFO frequency.
+The marker typically lands somewhere around **byte 1700–1900** for typical scope spans (200 kHz–500 kHz). Its position is stable for a given scope span and does not move with VFO frequency.
 
-### Beyond the Boundary
+### Bin Doubling
 
-Bins past the active spectrum are not garbage. Captured data shows two
-distinct regions in the rest of the 4096-byte packet:
-
-- A **reference / calibration block** (avg ≈ 233, low standard
-  deviation) immediately after the active spectrum.
-- A **second encoding region** further along, where the data is
-  centered on `128` instead of around the noise floor. This appears to
-  be a secondary signal source (possibly the digital sub-scope or RX2
-  output), encoded as deviation from the center (`128`) rather than as
-  amplitude from a noise floor.
-
-If you only need the main spectrum scope, stop at the boundary marker
-and ignore the rest. If you want to surface the secondary region,
-normalize it differently:
+Empirically, the bytes from `0` up to the boundary marker are **packed at two bytes per visible bin** — only the first half of that range produces a clean spectrum line. The reference client we built and verified against a live FTDX10 does:
 
 ```
-secondary_magnitude = |raw - 128| / 128.0
+usable_bin_count = boundary_marker_position // 2
 ```
 
-This dual-region structure was confirmed by comparing independent
-captures against FT-Control's pcap data — both show the same `~128`
-floor in the upper region, so it is not corruption.
+…and then reads `usable_bin_count` bytes starting at offset 0. So a marker at byte 1900 yields ~950 usable spectrum bins. The exact reason for the doubling (interleaved channels? oversampling artifact? padding for a higher-resolution radio?) is **not confirmed** — see [Open Questions](#open-questions). It is the empirical rule that produces a correct-looking waterfall.
+
+### Beyond the Boundary (observation only)
+
+Bytes past the boundary marker are **not currently decoded** by the verified reference client; everything below describes structure we observed in raw captures but never round-tripped through a working renderer. Treat it as a starting point for further reverse engineering rather than as part of the spec proper.
+
+Captured data shows two distinct regions in the rest of the 4096-byte packet:
+
+- A **reference / calibration block** (avg ≈ 233, low standard deviation) immediately after the marker.
+- A **second encoding region** further along, where the data is centered on `128` instead of around the noise floor. This *may* be a secondary signal source (digital sub-scope? RX2? main-scope alternate representation?), and *may* be encoded as deviation from the center:
+
+  ```
+  secondary_magnitude = |raw - 128| / 128.0
+  ```
+
+  Comparing our raw captures against FT-Control's own pcap data shows both produce the same `~128` floor in this region, which makes corruption an unlikely explanation. But we have not built a decoder that demonstrably renders this region correctly, so the encoding hypothesis is unverified.
+
+If you only need the main spectrum scope, stop at `boundary_marker // 2` and ignore everything else — that's what the reference client does.
 
 ### Bin-to-Frequency Mapping
 
@@ -625,10 +625,12 @@ or infer from `FA;` and the configured span setting) to map bin → Hz.
 A typical waterfall implementation:
 
 1. Decrypt each scope packet → 4096 amplitude bytes.
-2. Find the active range with the boundary-marker heuristic above.
-3. Normalize: `magnitude = 1.0 - raw/255.0`.
-4. Map magnitude → color (inverted ramp: high magnitude → bright).
-5. Scroll a 2D buffer one row per packet (≈25 rows/sec).
+2. Find the boundary marker with the heuristic above.
+3. Compute `usable_bin_count = marker_position // 2` (see [Bin Doubling](#bin-doubling)).
+4. Take bytes `0..usable_bin_count` from the packet.
+5. Normalize each: `magnitude = 1.0 - raw/255.0`.
+6. Map magnitude → color (inverted ramp: high magnitude → bright).
+7. Scroll a 2D buffer one row per packet (≈25 rows/sec).
 
 ## Reconnection
 
@@ -798,6 +800,8 @@ Help wanted on any of the following:
 - **Concurrent client behavior.** What exactly happens when a second
   client authenticates while a first is streaming? Captures of that
   state transition would be useful.
+- **Scope bin doubling.** Empirically, only the first `marker // 2` bytes produce a usable spectrum line. Why? Interleaved sources? Oversampling? Sub-pixel detail intended for a higher-resolution radio? We don't know — the halving was found by trial and error, not derived.
+- **The "secondary" scope region (bytes past the marker).** Captures show structured data past the marker — a high-flat reference block, then a region centered on `128`. We have not built a decoder for it. If you can render that region into something sensible (sub-scope? RX2? main-scope alternate representation?), open a PR.
 
 ---
 
